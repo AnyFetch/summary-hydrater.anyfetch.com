@@ -22,7 +22,8 @@
   ],
   "dependencies": {
     "async": "0.2.x",
-    "anyfetch-file-hydrater": "x.x.x"
+    "anyfetch-file-hydrater": "x.x.x",
+    "node-summary": "1.0.x"
   },
   "devDependencies": {
     "mocha": "1.17.x",
