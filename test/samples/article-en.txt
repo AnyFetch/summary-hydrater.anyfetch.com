@@ -1,0 +1,39 @@
+A few weeks ago, Eran Hammer of Walmart labs came to the Node.js core team complaining of a memory leak he had been tracking down for months. By expending a lot of effort over those few months he had taken the memory leak from a couple hundred megabytes a day, down to a mere eight megabytes a day. That in and of itself is an impressive feat, however, the source and final portion of the leak was elusive.
+
+So he spent more effort and found a test case that reproduced with only Node APIs, which placed the fault right at Node.js' doorstep. He found that the more HTTP client requests he did, the more memory his Node process would consume, but it was really slow. Here's the graph from his initial data:
+
+The top line is barely trending up, but it's enough to manifest in frustrating ways for Walmart. The good news is that Node.js is getting mature, the bad news is that a more mature Node.js means bugs are harder to find. So with the test client and server in hand, I started on my 3 week journey to track down this memory leak. Lucky for you, you're getting the abbreviated version here.
+
+First things first, I started the server and put it in the background since we were only interested in the client. Then I ran Node with UMEM_DEBUG set to record various important information about the memory allocations. This added a certain amount of overhead to the application, but since we were just using a test script it was completely safe. Also, we were exposing the GC so we could run it from inside the script, at the same time telling the GC to stay as compact as possible.
+
+Since it took a while to manifest, I had a little script to grab interesting information periodically from the client process. Every hour, it grabbed the output of pmap -x and a core file and stored those in Joyent Manta so we didn’t have to worry about storage space.
+
+Then I let this run for 15 hours. To start with, let's compare the output between the first pmap and the 15th pmap.
+
+The lines marked [ anon ] are mmap()'d regions of memory. Most of these are regions that V8 has allocated for your JavaScript objects. The lines marked [ heap ] are what you might consider the "traditional" heap, memory that is allocated with malloc() or new in C++ parlance. What you can see is that the traditional heap is growing rapidly over the 15 hours, but the V8 heap isn't growing, instead it's just shifting where its memory is stored.
+
+When I saw that I was leaking memory in the heap, I was excited, anticipating this was a classic memory leak. A leak that would happen because Node allocated memory, but neglected to free it. In MDB there's a particularly helpful command ::findleaks that will show you the memory addresses and the stack traces for leaked memory, not unlike using valgrind, but without all the performance penalty.
+
+Unfortunately for me, 61440 bytes is drastically less than the 160 megabytes actually leaking in the process as indicated by pmap. Another useful advantage of running with UMEM_DEBUG enabled, means we can tap into the cache information that libumem stores to let you know what sizes of memory are being allocated. You can access a lot of this information by simply using the ::umastat command.
+
+So at hour 15 we can see that there's 133MB allocated in the 4K cache. That's a significant amount of the memory we're trying to track down. Another feature of UMEM_DEBUG is that it keeps stack traces for those allocations, so I extended the venerable stackvis which can be used to generate flamegraphs for performance, but instead I used it to generate flamegraphs for the stack traces most responsible for the memory allocations in the 4k cache. You can see the full flamegraph, but below I've attached the interesting bit.
+
+The majority of this memory is being allocated by a method called HandleScope::Extend deep inside V8. Basically a HandleScope is used to keep track of the JavaScript objects that were allocated in this stack frame (and above) such that when this scope is deallocated it marks JavaScript objects as available for garbage collection. When we inspect this data we see we're collecting a lot of objects, but they're all the Undefined representative object.
+
+So what we knew at this point was that we were generating a lot of JavaScript objects, they were getting stored by some underlying HandleScope but that was never being deallocated such that those objects could be collected. We aren't seeing the V8 heap grow, because these are all singleton objects of Undefined.
+
+I had been doing all this work on our v0.10 branch, so Trevor Norris decided to look into it on the master branch of Node. Trevor was able to find a much smaller reproducible case, using that test case, I could reuse the same UMEM_DEBUG techniques, which revealed the predominate stack trace in the 4k cache:
+
+This stack had very little surface area to weed through, and when I looked at the node::CheckImmediate function, I noticed it was missing a HandleScope. By adding a HandleScope the memory leak went away. Magic.
+
+At this point we knew that we were looking for something in v0.10 that called MakeCallback but that didn't first have a HandleScope on the stack. I then worked up this simple DTrace script.
+
+Here we trace all the constructors and destructors for HandleScope as well as MakeCallback, if we see that MakeCallback has been called but we don't have any HandleScopes on the stack, grab the stack trace and keep track of how many times we see that stack trace. Finally, every 10 seconds print out the stack traces we've seen. The result was pretty damning.
+
+In 10 seconds, there was only one stack trace, and we saw that trace 3587 times. HandleWrap::OnClose was the culprit, it was calling MakeCallback without first adding a HandleScope to the stack. HandleWrap is an internal class used in Node to wrap file descriptors. That means that for every file descriptor that was closing, Node was potentially leaking 4 bytes of memory. So for someone like Walmart with lots of connections and lots of disconnects this was adding up to quite a lot of memory.
+
+There's only good news from here, the fix landed in the v0.10 branch, and is available in version v0.10.22. We've also made a change in the master branch that will allow us to detect this type of bug much sooner, even if the error is coming from a misbehaving binary add-on.
+
+I want to thank my fellow engineers here at Joyent: Josh Clulow, Dave Pacheco, Robert Mustacchi, and Bryan Cantrill all of whom were instrumental in the process of finding this leak. Also, thanks to Trevor Norris for finding the reduced test case for master which helped us cross the finish line. This was a team effort, and demonstrates what an incredible team we have at our disposal. So it may have taken 3 weeks to hunt this 4 byte memory leak down, but in the end, it was incredibly satisfying to finally nail it down.
+
+You can experience the saga yourself as Eran and I walk through the set up, identification, and resolution of this memory leak.

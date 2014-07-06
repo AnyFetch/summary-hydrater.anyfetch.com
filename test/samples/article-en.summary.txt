@@ -1,0 +1,19 @@
+Walmart Node.js Memory Leak
+That in and of itself is an impressive feat, however, the source and final portion of the leak was elusive.
+He found that the more HTTP client requests he did, the more memory his Node process would consume, but it was really slow.
+The good news is that Node.js is getting mature, the bad news is that a more mature Node.js means bugs are harder to find.
+This added a certain amount of overhead to the application, but since we were just using a test script it was completely safe.
+Every hour, it grabbed the output of pmap -x and a core file and stored those in Joyent Manta so we didn’t have to worry about storage space.
+Then I let this run for 15 hours.
+The lines marked [ heap ] are what you might consider the "traditional" heap, memory that is allocated with malloc() or new in C++ parlance.
+When I saw that I was leaking memory in the heap, I was excited, anticipating this was a classic memory leak.
+Unfortunately for me, 61440 bytes is drastically less than the 160 megabytes actually leaking in the process as indicated by pmap.
+You can see the full flamegraph, but below I've attached the interesting bit.
+The majority of this memory is being allocated by a method called HandleScope::Extend deep inside V8.
+We aren't seeing the V8 heap grow, because these are all singleton objects of Undefined.
+By adding a HandleScope the memory leak went away.
+At this point we knew that we were looking for something in v0.10 that called MakeCallback but that didn't first have a HandleScope on the stack.
+Finally, every 10 seconds print out the stack traces we've seen.
+In 10 seconds, there was only one stack trace, and we saw that trace 3587 times.
+There's only good news from here, the fix landed in the v0.10 branch, and is available in version v0.10.22.
+This was a team effort, and demonstrates what an incredible team we have at our disposal.
